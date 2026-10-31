@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 import logging
 log = logging.getLogger("uvicorn.error")
+LAST_ERR = {"t": None, "msg": None}
 
 PROFILE = "ga5-incident-agent/v2"
 BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -58,9 +59,6 @@ Rules: use only tools in toolCatalog; arguments must follow inputSchema and use 
 the effect must be one of policy.effectTools; if the service is already at its permitted scaling limit,
 choose the tool that pages the owner instead of scaling; never invent values."""
 
-import logging
-log = logging.getLogger("uvicorn.error")
-
 def call_model(body, timeout):
     inc = body["incident"]
     payload = {
@@ -71,15 +69,22 @@ def call_model(body, timeout):
     base_req = {"model": MODEL, "temperature": 0,
                 "messages": [{"role": "system", "content": SYSTEM},
                              {"role": "user", "content": json.dumps(payload)}]}
+    end = time.time() + timeout
+    JSON = {"response_format": {"type": "json_object"}}
     last = None
-    for extra in ({"reasoning_effort": "low"}, {}):        # retry without the extra if rejected
-        r = httpx.post(BASE + "/chat/completions", headers={"Authorization": "Bearer " + KEY},
-                       json={**base_req, **extra}, timeout=timeout)
+    for extra in ({"reasoning_effort": "low", **JSON}, JSON, {}):
+        for _ in range(2):
+            r = httpx.post(BASE + "/chat/completions", headers={"Authorization": "Bearer " + KEY},
+                           json={**base_req, **extra}, timeout=max(2, end - time.time()))
+            if r.status_code in (429, 500, 502, 503) and end - time.time() > 4:
+                last = f"llm {r.status_code}"; time.sleep(1.5); continue
+            break
         if r.status_code == 200:
-            txt = r.json()["choices"][0]["message"]["content"] or ""
+            txt = r.json()["choices"][0]["message"].get("content") or ""
             m = re.search(r"\{.*\}", txt, re.S)
+            if not m: raise ValueError("no JSON in reply: " + txt[:150])
             return json.loads(m.group(0))
-        last = f"gemini {r.status_code}: {r.text[:200]}"
+        last = f"llm {r.status_code}: {r.text[:200]}"
         if r.status_code != 400: break
     raise RuntimeError(last)
 
@@ -119,14 +124,16 @@ def clean_plan(p, body):
             "effect": {"tool": ename, "args": as_obj(e.get("arguments")), "ev": ee}}
 
 def make_plan(body):
-    deadline = time.time() + 15.5                       # request limit is 18s
+    deadline = time.time() + 15.5
     for attempt in range(2):
         left = deadline - time.time()
         if left < 3: break
         try:
             return clean_plan(call_model(body, left), body)
         except Exception as ex:
-            log.error("PLAN FAIL attempt %d: %s: %s", attempt + 1, type(ex).__name__, str(ex)[:300])
+            msg = f"attempt {attempt+1}: {type(ex).__name__}: {str(ex)[:300]}"
+            LAST_ERR["msg"], LAST_ERR["t"] = msg, time.time()
+            log.error("PLAN FAIL %s", msg)
     return None
     
 # ---------- LAYER 2: STATE MACHINE (no model, no guessing) ----------
@@ -394,3 +401,6 @@ async def selftest():
     except Exception as e:
         info["error"] = type(e).__name__
     return info
+
+@app.get("/lasterror")
+async def lasterror(): return LAST_ERR
