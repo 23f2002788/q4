@@ -356,3 +356,17 @@ async def get_run(run_id: str):
 
 @app.get("/")
 async def health(): return {"ok": True}
+
+@app.get("/selftest")
+async def selftest():
+    info = {"key_set": bool(KEY), "key_length": len(KEY), "base": BASE, "model": MODEL}
+    try:
+        r = httpx.post(BASE + "/chat/completions",
+                       headers={"Authorization": "Bearer " + KEY},
+                       json={"model": MODEL, "messages": [{"role": "user", "content": "say ok"}]},
+                       timeout=14)
+        info["gemini_status"] = r.status_code
+        info["gemini_reply"] = r.text[:150]
+    except Exception as e:
+        info["error"] = type(e).__name__
+    return info
