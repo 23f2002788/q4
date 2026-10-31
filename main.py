@@ -4,6 +4,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
+import logging
+log = logging.getLogger("uvicorn.error")
 
 PROFILE = "ga5-incident-agent/v2"
 BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -56,55 +58,77 @@ Rules: use only tools in toolCatalog; arguments must follow inputSchema and use 
 the effect must be one of policy.effectTools; if the service is already at its permitted scaling limit,
 choose the tool that pages the owner instead of scaling; never invent values."""
 
-def call_model(body):
+import logging
+log = logging.getLogger("uvicorn.error")
+
+def call_model(body, timeout):
     inc = body["incident"]
     payload = {
         "incident": {k: inc[k] for k in ("incidentId", "title", "service", "severity", "transcript", "allowedRootCauses") if k in inc},
         "toolCatalog": body["toolCatalog"],
         "policy": {k: v for k, v in body["policy"].items() if k != "doNotExport"},
-    }   # note: body["sensitive"] is never sent
-    r = httpx.post(BASE + "/chat/completions",
-                   headers={"Authorization": "Bearer " + KEY},
-                   json={"model": MODEL, "temperature": 0,
-                         "response_format": {"type": "json_object"},
-                         "messages": [{"role": "system", "content": SYSTEM},
-                                      {"role": "user", "content": json.dumps(payload)}]},
-                   timeout=14)
-    txt = r.json()["choices"][0]["message"]["content"].strip()
-    txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
-    return json.loads(txt)
+    }
+    base_req = {"model": MODEL, "temperature": 0,
+                "messages": [{"role": "system", "content": SYSTEM},
+                             {"role": "user", "content": json.dumps(payload)}]}
+    last = None
+    for extra in ({"reasoning_effort": "low"}, {}):        # retry without the extra if rejected
+        r = httpx.post(BASE + "/chat/completions", headers={"Authorization": "Bearer " + KEY},
+                       json={**base_req, **extra}, timeout=timeout)
+        if r.status_code == 200:
+            txt = r.json()["choices"][0]["message"]["content"] or ""
+            m = re.search(r"\{.*\}", txt, re.S)
+            return json.loads(m.group(0))
+        last = f"gemini {r.status_code}: {r.text[:200]}"
+        if r.status_code != 400: break
+    raise RuntimeError(last)
+
+def as_obj(x):
+    if isinstance(x, str):
+        try: return json.loads(x)
+        except Exception: return {}
+    return x if isinstance(x, dict) else {}
+
+def eid(x): return str(x).strip().strip("[]").strip()
 
 def clean_plan(p, body):
     inc, pol = body["incident"], body["policy"]
     ids = set(re.findall(r"^\s*\[([^\]\s]+)\]", inc["transcript"], re.M))
-    if p["rootCause"] not in inc["allowedRootCauses"]: raise ValueError
-    ev = []
-    for e in p["evidence"]:
-        if e in ids and e not in ev: ev.append(e)
-    ev = ev[:4]
-    if len(ev) < 2: raise ValueError
+    root = p.get("rootCause")
+    if root not in inc["allowedRootCauses"]: raise ValueError(f"bad rootCause {root!r}")
+    ev = [e for e in dict.fromkeys(eid(x) for x in p.get("evidence", [])) if e in ids][:4]
+    if len(ev) < 2: raise ValueError(f"evidence {p.get('evidence')!r} not in transcript ids")
     tools = {t["name"] for t in body["toolCatalog"]}
     diags, seen = [], set()
-    for d in p["diagnostics"]:
-        if d["toolName"] not in tools or not isinstance(d["arguments"], dict): continue
-        key = canon([d["toolName"], d["arguments"]])
+    for d in p.get("diagnostics", []):
+        name = d.get("toolName") or d.get("tool") or d.get("name")
+        args = as_obj(d.get("arguments"))
+        if name not in tools: continue
+        key = canon([name, args])
         if key in seen: continue
         seen.add(key)
-        de = [e for e in dict.fromkeys(d.get("evidence", [])) if e in ev] or ev[:1]
-        diags.append({"tool": d["toolName"], "args": d["arguments"], "ev": de})
+        de = [e for e in dict.fromkeys(eid(x) for x in d.get("evidence", [])) if e in ev] or ev[:1]
+        diags.append({"tool": name, "args": args, "ev": de})
     diags = diags[:min(3, int(pol.get("maximumDiagnostics", 3)))]
-    e = p["effect"]
-    if not diags or e["toolName"] not in pol["effectTools"] or e["toolName"] not in tools: raise ValueError
-    ee = [x for x in dict.fromkeys(e.get("evidence", [])) if x in ev] or ev[:1]
-    return {"rootCause": p["rootCause"], "evidence": ev, "diagnostics": diags,
-            "effect": {"tool": e["toolName"], "args": e["arguments"], "ev": ee}}
+    e = p.get("effect") or {}
+    ename = e.get("toolName") or e.get("tool") or e.get("name")
+    if not diags: raise ValueError("no valid diagnostics")
+    if ename not in pol["effectTools"] or ename not in tools: raise ValueError(f"bad effect {ename!r}")
+    ee = [x for x in dict.fromkeys(eid(y) for y in e.get("evidence", [])) if x in ev] or ev[:1]
+    return {"rootCause": root, "evidence": ev, "diagnostics": diags,
+            "effect": {"tool": ename, "args": as_obj(e.get("arguments")), "ev": ee}}
 
 def make_plan(body):
-    for _ in range(2):
-        try: return clean_plan(call_model(body), body)
-        except Exception: pass
+    deadline = time.time() + 15.5                       # request limit is 18s
+    for attempt in range(2):
+        left = deadline - time.time()
+        if left < 3: break
+        try:
+            return clean_plan(call_model(body, left), body)
+        except Exception as ex:
+            log.error("PLAN FAIL attempt %d: %s: %s", attempt + 1, type(ex).__name__, str(ex)[:300])
     return None
-
+    
 # ---------- LAYER 2: STATE MACHINE (no model, no guessing) ----------
 def new_id(prefix): return prefix + uuid.uuid4().hex[:16]
 
